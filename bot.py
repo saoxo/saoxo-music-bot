@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import os
 import subprocess
@@ -620,8 +621,32 @@ def main() -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
 
-    print("Saoxo Music est lancé. Appuie sur Ctrl+C pour l'arrêter.")
-    application.run_polling()
+    public_domain = os.getenv("KOYEB_PUBLIC_DOMAIN")
+    if public_domain:
+        public_domain = (
+            public_domain.removeprefix("https://")
+            .removeprefix("http://")
+            .strip("/")
+        )
+        webhook_path = hashlib.sha256(
+            f"path:{BOT_TOKEN}".encode("utf-8")
+        ).hexdigest()
+        webhook_secret = hashlib.sha256(
+            f"secret:{BOT_TOKEN}".encode("utf-8")
+        ).hexdigest()
+        port = int(os.getenv("PORT", "8000"))
+
+        print("Saoxo Music est lancé sur Koyeb avec un webhook.")
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=webhook_path,
+            webhook_url=f"https://{public_domain}/{webhook_path}",
+            secret_token=webhook_secret,
+        )
+    else:
+        print("Saoxo Music est lancé. Appuie sur Ctrl+C pour l'arrêter.")
+        application.run_polling()
 
 
 if __name__ == "__main__":
