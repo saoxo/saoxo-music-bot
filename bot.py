@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import urlparse
@@ -111,31 +112,7 @@ def clear_conversion(context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data.pop(key, None)
 
 
-def download_link_media_sync(source_url: str, temporary_path: Path) -> Path:
-    deno_directory = str(Path(deno.find_deno_bin()).parent)
-    current_path = os.environ.get("PATH", "")
-    if deno_directory not in current_path.split(os.pathsep):
-        os.environ["PATH"] = f"{deno_directory}{os.pathsep}{current_path}"
-
-    output_template = str(temporary_path / "download.%(ext)s")
-    options = {
-        "format": "bestaudio/best",
-        "outtmpl": output_template,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "retries": 3,
-        "fragment_retries": 3,
-        "socket_timeout": 30,
-        "overwrites": True,
-        "cachedir": False,
-        "max_filesize": 100 * 1024 * 1024,
-        "ffmpeg_location": get_ffmpeg_exe(),
-    }
-
-    with YoutubeDL(options) as downloader:
-        downloader.extract_info(source_url, download=True)
-
+def find_downloaded_media(temporary_path: Path) -> Path:
     candidates = [
         path
         for path in temporary_path.iterdir()
@@ -147,6 +124,79 @@ def download_link_media_sync(source_url: str, temporary_path: Path) -> Path:
         raise RuntimeError("yt-dlp did not create a media file")
 
     return max(candidates, key=lambda path: path.stat().st_size)
+
+
+def media_has_audio(media_path: Path) -> bool:
+    result = subprocess.run(
+        [
+            get_ffmpeg_exe(),
+            "-v",
+            "error",
+            "-i",
+            str(media_path),
+            "-map",
+            "0:a:0",
+            "-frames:a",
+            "1",
+            "-f",
+            "null",
+            "-",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def download_link_media_sync(source_url: str, temporary_path: Path) -> Path:
+    deno_directory = str(Path(deno.find_deno_bin()).parent)
+    current_path = os.environ.get("PATH", "")
+    if deno_directory not in current_path.split(os.pathsep):
+        os.environ["PATH"] = f"{deno_directory}{os.pathsep}{current_path}"
+
+    def download(extractor_args=None) -> Path:
+        options = {
+            "format": (
+                "bestaudio[acodec!=none]/best[acodec!=none]/bestaudio/best"
+            ),
+            "outtmpl": str(temporary_path / "download.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "retries": 3,
+            "fragment_retries": 3,
+            "socket_timeout": 30,
+            "overwrites": True,
+            "cachedir": False,
+            "max_filesize": 100 * 1024 * 1024,
+            "ffmpeg_location": get_ffmpeg_exe(),
+        }
+        if extractor_args:
+            options["extractor_args"] = extractor_args
+
+        with YoutubeDL(options) as downloader:
+            downloader.extract_info(source_url, download=True)
+
+        return find_downloaded_media(temporary_path)
+
+    input_path = download()
+    if media_has_audio(input_path):
+        return input_path
+
+    host = (urlparse(source_url).hostname or "").lower()
+    is_tiktok = host == "tiktok.com" or host.endswith(".tiktok.com")
+    if is_tiktok:
+        for path in temporary_path.glob("download.*"):
+            if path.is_file():
+                path.unlink()
+
+        input_path = download({"tiktok": {"app_info": [""]}})
+        if media_has_audio(input_path):
+            return input_path
+
+    raise RuntimeError("The downloaded media does not contain an audio stream")
 
 
 async def download_link_media(source_url: str, temporary_path: Path) -> Path:
