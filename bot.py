@@ -1,9 +1,11 @@
 import asyncio
 import logging
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import urlparse
 
+import deno
 from imageio_ffmpeg import get_ffmpeg_exe
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import (
@@ -17,6 +19,7 @@ from telegram.ext import (
 
 from config import BOT_TOKEN
 from translations import text
+from yt_dlp import YoutubeDL
 
 
 logging.basicConfig(
@@ -25,6 +28,7 @@ logging.basicConfig(
 )
 
 MAX_TELEGRAM_DOWNLOAD_SIZE = 20 * 1024 * 1024
+MAX_TELEGRAM_UPLOAD_SIZE = 50 * 1024 * 1024
 
 
 def language_keyboard() -> InlineKeyboardMarkup:
@@ -107,6 +111,52 @@ def clear_conversion(context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data.pop(key, None)
 
 
+def download_link_media_sync(source_url: str, temporary_path: Path) -> Path:
+    deno_directory = str(Path(deno.find_deno_bin()).parent)
+    current_path = os.environ.get("PATH", "")
+    if deno_directory not in current_path.split(os.pathsep):
+        os.environ["PATH"] = f"{deno_directory}{os.pathsep}{current_path}"
+
+    output_template = str(temporary_path / "download.%(ext)s")
+    options = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 30,
+        "overwrites": True,
+        "cachedir": False,
+        "max_filesize": 100 * 1024 * 1024,
+        "ffmpeg_location": get_ffmpeg_exe(),
+    }
+
+    with YoutubeDL(options) as downloader:
+        downloader.extract_info(source_url, download=True)
+
+    candidates = [
+        path
+        for path in temporary_path.iterdir()
+        if path.is_file()
+        and path.name.startswith("download.")
+        and not path.name.endswith(".part")
+    ]
+    if not candidates:
+        raise RuntimeError("yt-dlp did not create a media file")
+
+    return max(candidates, key=lambda path: path.stat().st_size)
+
+
+async def download_link_media(source_url: str, temporary_path: Path) -> Path:
+    return await asyncio.to_thread(
+        download_link_media_sync,
+        source_url,
+        temporary_path,
+    )
+
+
 def safe_filename(value: str) -> str:
     cleaned = "".join(
         character if character.isalnum() or character in " ._-" else "_"
@@ -147,8 +197,14 @@ async def convert_and_send(
             output_path = temporary_path / "converted.mp3"
             thumbnail_path = None
 
-            telegram_file = await context.bot.get_file(source_file_id)
-            await telegram_file.download_to_drive(custom_path=input_path)
+            if source_file_id:
+                telegram_file = await context.bot.get_file(source_file_id)
+                await telegram_file.download_to_drive(custom_path=input_path)
+            else:
+                source_url = context.user_data.get("source_url")
+                if not source_url:
+                    raise RuntimeError("Missing source URL")
+                input_path = await download_link_media(source_url, temporary_path)
 
             ffmpeg_arguments = ["-y", "-i", str(input_path)]
 
@@ -210,6 +266,8 @@ async def convert_and_send(
 
             if not output_path.exists():
                 raise RuntimeError("FFmpeg did not create the MP3 file")
+            if output_path.stat().st_size > MAX_TELEGRAM_UPLOAD_SIZE:
+                raise RuntimeError("The converted MP3 exceeds Telegram upload limits")
 
             output_name = f"{safe_filename(title)}.mp3"
             with output_path.open("rb") as audio_file:
@@ -251,7 +309,7 @@ async def finish_source(message, context: ContextTypes.DEFAULT_TYPE, language: s
     artist = context.user_data.get("artist", "")
     source_kind = context.user_data.get("source_kind")
 
-    if source_kind in {"telegram_audio", "telegram_video"}:
+    if source_kind in {"telegram_audio", "telegram_video", "link"}:
         await convert_and_send(message, context, language, title, artist)
     else:
         clear_conversion(context)
@@ -269,6 +327,7 @@ async def accept_link(message, context: ContextTypes.DEFAULT_TYPE, language: str
         return
 
     context.user_data["source_url"] = value.strip()
+    context.user_data["source_kind"] = "link"
     context.user_data["step"] = "title"
     await message.reply_text(text(language, "link_accepted"))
     await message.reply_text(text(language, "ask_title"))
