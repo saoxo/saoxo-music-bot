@@ -177,6 +177,9 @@ def download_link_media_sync(source_url: str, temporary_path: Path) -> Path:
         pot_provider_home = os.getenv("POT_PROVIDER_HOME")
         if pot_provider_home:
             options["extractor_args"] = {
+                "youtube": {
+                    "player_client": ["mweb"],
+                },
                 "youtubepot-bgutilscript": {
                     "server_home": [pot_provider_home],
                 }
