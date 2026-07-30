@@ -174,8 +174,15 @@ def download_link_media_sync(source_url: str, temporary_path: Path) -> Path:
             "max_filesize": 100 * 1024 * 1024,
             "ffmpeg_location": get_ffmpeg_exe(),
         }
+        pot_provider_home = os.getenv("POT_PROVIDER_HOME")
+        if pot_provider_home:
+            options["extractor_args"] = {
+                "youtubepot-bgutilscript": {
+                    "server_home": [pot_provider_home],
+                }
+            }
         if extractor_args:
-            options["extractor_args"] = extractor_args
+            options.setdefault("extractor_args", {}).update(extractor_args)
 
         with YoutubeDL(options) as downloader:
             downloader.extract_info(source_url, download=True)
