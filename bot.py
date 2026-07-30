@@ -621,7 +621,11 @@ def main() -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
 
-    public_domain = os.getenv("KOYEB_PUBLIC_DOMAIN")
+    public_domain = (
+        os.getenv("KOYEB_PUBLIC_DOMAIN")
+        or os.getenv("RENDER_EXTERNAL_HOSTNAME")
+        or os.getenv("RENDER_EXTERNAL_URL")
+    )
     if public_domain:
         public_domain = (
             public_domain.removeprefix("https://")
@@ -636,7 +640,8 @@ def main() -> None:
         ).hexdigest()
         port = int(os.getenv("PORT", "8000"))
 
-        print("Saoxo Music est lancé sur Koyeb avec un webhook.")
+        hosting_provider = "Render" if os.getenv("RENDER_SERVICE_ID") else "Koyeb"
+        print(f"Saoxo Music est lancé sur {hosting_provider} avec un webhook.")
         application.run_webhook(
             listen="0.0.0.0",
             port=port,
