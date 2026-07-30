@@ -1,7 +1,11 @@
+import asyncio
 import logging
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.parse import urlparse
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from imageio_ffmpeg import get_ffmpeg_exe
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -19,6 +23,8 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.WARNING,
 )
+
+MAX_TELEGRAM_DOWNLOAD_SIZE = 20 * 1024 * 1024
 
 
 def language_keyboard() -> InlineKeyboardMarkup:
@@ -52,6 +58,21 @@ def back_keyboard(language: str) -> InlineKeyboardMarkup:
     )
 
 
+def cover_keyboard(language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(text(language, "add_cover"), callback_data="cover:add")],
+            [InlineKeyboardButton(text(language, "skip_cover"), callback_data="cover:skip")],
+        ]
+    )
+
+
+def skip_cover_keyboard(language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(text(language, "skip_cover"), callback_data="cover:skip")]]
+    )
+
+
 def is_supported_url(value: str) -> bool:
     try:
         parsed = urlparse(value.strip())
@@ -74,8 +95,171 @@ def is_supported_url(value: str) -> bool:
 
 
 def clear_conversion(context: ContextTypes.DEFAULT_TYPE) -> None:
-    for key in ("step", "source_url", "source_file_id", "source_kind", "title"):
+    for key in (
+        "step",
+        "source_url",
+        "source_file_id",
+        "source_kind",
+        "title",
+        "artist",
+        "cover_file_id",
+    ):
         context.user_data.pop(key, None)
+
+
+def safe_filename(value: str) -> str:
+    cleaned = "".join(
+        character if character.isalnum() or character in " ._-" else "_"
+        for character in value
+    ).strip(" .")
+    return (cleaned or "saoxo-music")[:80]
+
+
+async def run_ffmpeg(*arguments: str) -> None:
+    process = await asyncio.create_subprocess_exec(
+        get_ffmpeg_exe(),
+        *arguments,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, error_output = await process.communicate()
+
+    if process.returncode != 0:
+        error_details = error_output.decode("utf-8", errors="replace")[-1000:]
+        raise RuntimeError(f"FFmpeg failed: {error_details}")
+
+
+async def convert_and_send(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    language: str,
+    title: str,
+    artist: str,
+) -> None:
+    status_message = await message.reply_text(text(language, "processing"))
+    source_file_id = context.user_data.get("source_file_id")
+    cover_file_id = context.user_data.get("cover_file_id")
+
+    try:
+        with TemporaryDirectory(prefix="saoxo_music_") as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            input_path = temporary_path / "source_media"
+            output_path = temporary_path / "converted.mp3"
+            thumbnail_path = None
+
+            telegram_file = await context.bot.get_file(source_file_id)
+            await telegram_file.download_to_drive(custom_path=input_path)
+
+            ffmpeg_arguments = ["-y", "-i", str(input_path)]
+
+            if cover_file_id:
+                cover_input_path = temporary_path / "cover_source"
+                thumbnail_path = temporary_path / "cover.jpg"
+                telegram_cover = await context.bot.get_file(cover_file_id)
+                await telegram_cover.download_to_drive(custom_path=cover_input_path)
+
+                await run_ffmpeg(
+                    "-y",
+                    "-i",
+                    str(cover_input_path),
+                    "-vf",
+                    "scale=320:320:force_original_aspect_ratio=decrease,"
+                    "pad=320:320:(ow-iw)/2:(oh-ih)/2:black",
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "7",
+                    str(thumbnail_path),
+                )
+
+                ffmpeg_arguments.extend(
+                    [
+                        "-i",
+                        str(thumbnail_path),
+                        "-map",
+                        "0:a:0",
+                        "-map",
+                        "1:v:0",
+                        "-codec:v",
+                        "mjpeg",
+                        "-disposition:v:0",
+                        "attached_pic",
+                    ]
+                )
+            else:
+                ffmpeg_arguments.extend(["-map", "0:a:0", "-vn"])
+
+            ffmpeg_arguments.extend(
+                [
+                    "-map_metadata",
+                    "-1",
+                    "-codec:a",
+                    "libmp3lame",
+                    "-b:a",
+                    "192k",
+                    "-metadata",
+                    f"title={title}",
+                    "-metadata",
+                    f"artist={artist}",
+                    "-id3v2_version",
+                    "3",
+                    str(output_path),
+                ]
+            )
+            await run_ffmpeg(*ffmpeg_arguments)
+
+            if not output_path.exists():
+                raise RuntimeError("FFmpeg did not create the MP3 file")
+
+            output_name = f"{safe_filename(title)}.mp3"
+            with output_path.open("rb") as audio_file:
+                audio_input = InputFile(
+                    audio_file,
+                    filename=output_name,
+                    read_file_handle=False,
+                )
+
+                if thumbnail_path:
+                    with thumbnail_path.open("rb") as thumbnail_file:
+                        await message.reply_audio(
+                            audio=audio_input,
+                            thumbnail=InputFile(
+                                thumbnail_file,
+                                filename="cover.jpg",
+                                read_file_handle=False,
+                            ),
+                            title=title,
+                            performer=artist,
+                        )
+                else:
+                    await message.reply_audio(
+                        audio=audio_input,
+                        title=title,
+                        performer=artist,
+                    )
+
+        await status_message.edit_text(text(language, "conversion_sent"))
+    except Exception:
+        logging.exception("Telegram media conversion failed")
+        await status_message.edit_text(text(language, "conversion_error"))
+    finally:
+        clear_conversion(context)
+
+
+async def finish_source(message, context: ContextTypes.DEFAULT_TYPE, language: str) -> None:
+    title = context.user_data.get("title", "")
+    artist = context.user_data.get("artist", "")
+    source_kind = context.user_data.get("source_kind")
+
+    if source_kind in {"telegram_audio", "telegram_video"}:
+        await convert_and_send(message, context, language, title, artist)
+    else:
+        clear_conversion(context)
+        await message.reply_text(text(language, "ready", title=title, artist=artist))
+
+    await message.reply_text(
+        text(language, "welcome"), reply_markup=main_menu(language)
+    )
 
 
 async def accept_link(message, context: ContextTypes.DEFAULT_TYPE, language: str, value: str) -> None:
@@ -143,6 +327,23 @@ async def button_handler(
 
     language = context.user_data.get("language", "fr")
 
+
+    if query.data == "cover:add":
+        await query.answer()
+        context.user_data["step"] = "cover_image"
+        await query.edit_message_text(
+            text(language, "ask_cover_image"),
+            reply_markup=skip_cover_keyboard(language),
+        )
+        return
+
+    if query.data == "cover:skip":
+        await query.answer()
+        context.user_data.pop("cover_file_id", None)
+        await query.edit_message_text(text(language, "cover_skipped"))
+        await finish_source(query.message, context, language)
+        return
+
     if query.data == "menu:convert":
         await query.answer()
         clear_conversion(context)
@@ -186,6 +387,10 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     media = update.message.audio or update.message.voice or update.message.document
+    if media.file_size and media.file_size > MAX_TELEGRAM_DOWNLOAD_SIZE:
+        await update.message.reply_text(text(language, "file_too_large"))
+        return
+
     clear_conversion(context)
     context.user_data["source_file_id"] = media.file_id
     context.user_data["source_kind"] = "telegram_audio"
@@ -204,12 +409,41 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     media = update.message.video or update.message.video_note or update.message.document
+    if media.file_size and media.file_size > MAX_TELEGRAM_DOWNLOAD_SIZE:
+        await update.message.reply_text(text(language, "file_too_large"))
+        return
+
     clear_conversion(context)
     context.user_data["source_file_id"] = media.file_id
     context.user_data["source_kind"] = "telegram_video"
     context.user_data["step"] = "title"
     await update.message.reply_text(text(language, "video_accepted"))
     await update.message.reply_text(text(language, "ask_title"))
+
+
+async def handle_cover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    language = context.user_data.get("language")
+    if not language:
+        await update.message.reply_text(
+            "🌍 Choisis ta langue / Choose your language:",
+            reply_markup=language_keyboard(),
+        )
+        return
+
+    if context.user_data.get("step") != "cover_image":
+        await update.message.reply_text(
+            text(language, "use_menu"), reply_markup=main_menu(language)
+        )
+        return
+
+    image = update.message.photo[-1] if update.message.photo else update.message.document
+    if image.file_size and image.file_size > MAX_TELEGRAM_DOWNLOAD_SIZE:
+        await update.message.reply_text(text(language, "file_too_large"))
+        return
+
+    context.user_data["cover_file_id"] = image.file_id
+    await update.message.reply_text(text(language, "cover_received"))
+    await finish_source(update.message, context, language)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -242,11 +476,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text(text(language, "invalid_artist"))
             return
 
-        title = context.user_data.get("title", "")
-        clear_conversion(context)
+        context.user_data["artist"] = value
+        context.user_data["step"] = "cover_choice"
         await update.message.reply_text(
-            text(language, "ready", title=title, artist=value),
-            reply_markup=main_menu(language),
+            text(language, "ask_cover"),
+            reply_markup=cover_keyboard(language),
         )
         return
 
@@ -269,6 +503,9 @@ def main() -> None:
         MessageHandler(
             filters.AUDIO | filters.VOICE | filters.Document.AUDIO, handle_audio
         )
+    )
+    application.add_handler(
+        MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_cover)
     )
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
