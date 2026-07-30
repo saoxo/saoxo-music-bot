@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import hashlib
 import logging
 import os
@@ -157,6 +159,24 @@ def download_link_media_sync(source_url: str, temporary_path: Path) -> Path:
     if deno_directory not in current_path.split(os.pathsep):
         os.environ["PATH"] = f"{deno_directory}{os.pathsep}{current_path}"
 
+    cookie_file = None
+    encoded_cookies = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+    if encoded_cookies:
+        try:
+            cookie_data = base64.b64decode(encoded_cookies, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise RuntimeError("Le secret YouTube est invalide.") from error
+
+        first_line = cookie_data.splitlines()[0] if cookie_data else b""
+        if first_line not in {
+            b"# HTTP Cookie File",
+            b"# Netscape HTTP Cookie File",
+        }:
+            raise RuntimeError("Le fichier de cookies YouTube est invalide.")
+
+        cookie_file = temporary_path / "youtube-cookies.txt"
+        cookie_file.write_bytes(cookie_data)
+
     def download(extractor_args=None) -> Path:
         options = {
             "format": (
@@ -175,6 +195,9 @@ def download_link_media_sync(source_url: str, temporary_path: Path) -> Path:
             "max_filesize": 100 * 1024 * 1024,
             "ffmpeg_location": get_ffmpeg_exe(),
         }
+        if cookie_file:
+            options["cookiefile"] = str(cookie_file)
+
         pot_provider_home = os.getenv("POT_PROVIDER_HOME")
         if pot_provider_home:
             options["extractor_args"] = {
